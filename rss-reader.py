@@ -6,14 +6,20 @@ import feedparser
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import logging
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+import time
 
 # ログファイルとログレベルの設定
+LOG_FILE = "rss_reader.log"
+if os.path.exists(LOG_FILE): # 既存のログファイルがあれば削除
+    os.remove(LOG_FILE)
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.FileHandler("rss_reader.log", encoding='utf-8'),
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -25,6 +31,21 @@ BOOKMARKS_PATH = os.path.expanduser(
 )
 TARGET_FOLDER_NAME = "web-manga" # You need to configure it before execution
 OUTPUT_FILE = "recent_feeds.txt"
+
+# 名前空間定義（gigaタグを使っているRSSに合わせて更新してください）
+NAMESPACES = {
+    'atom': 'http://www.w3.org/2005/Atom',
+    'giga': 'https://gigaviewer.com'  # 実際のRSSのnamespace URIに合わせて変更
+}
+
+# HTTPリクエストヘッダー定義
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/137.0.0.0 Safari/537.36"
+    )
+}
 
 # --- 関数定義 ---
 
@@ -41,14 +62,7 @@ def find_manga_folder(bookmark_data, folder_name):
 
 def find_rss_url(name, site_url):
     try:
-        headers = {
-           "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/137.0.0.0 Safari/537.36"
-            )
-        }
-        res = requests.get(site_url, headers=headers, timeout=10)
+        res = requests.get(site_url, headers=HEADERS, timeout=10)
         res.raise_for_status()
         soup = BeautifulSoup(res.content, "html.parser")
 
@@ -86,17 +100,72 @@ def find_rss_url(name, site_url):
         logging.exception(f"[!] RSS URL取得エラー: {name} : {site_url} ({e})")
         return None
 
+def get_published_date(feed):
+    entries = feed.entries
+    if not entries:
+        return None
+    published = entries[0].get("published_parsed")
+    if published:
+        return datetime.fromtimestamp(time.mktime(published))
+    return None
+
+def get_updated_date(feed):
+    entries = feed.entries
+    if not entries:
+        return None
+    updated = entries[0].get("updated_parsed")
+    if updated:
+        return datetime.fromtimestamp(time.mktime(updated))
+    return None
+
+# RSSフィードが<giga:freeTermStartDate>タグを含む場合、<giga:freeTermStartDate>の日時を取得する
+# サンプル：https://comic-days.com/atom/series/13933686331730851805
+def get_free_term_start_date(feed_url):
+    try:
+        res = requests.get(feed_url, headers=HEADERS, timeout=10)
+        res.raise_for_status()
+        root = ET.fromstring(res.content)
+        # 全ての entry を取得
+        entries = root.findall('atom:entry', NAMESPACES)
+        max_date = None # (freeTermStartDate, pubDate) のタプル
+        for entry in entries:
+            # <giga:freeTermStartDate> を取得
+            free_elem = entry.find("giga:freeTermStartDate", NAMESPACES)
+            updated_elem = entry.find("atom:updated", NAMESPACES)
+            if free_elem is not None and updated_elem is not None:
+                try:
+                    free_date = datetime.strptime(free_elem.text, "%Y-%m-%dT%H:%M:%SZ")
+                    pub_date = datetime.strptime(updated_elem.text, "%Y-%m-%dT%H:%M:%SZ")
+
+                    # ループ1回目の処理：max_date がまだ未定義であるため値を代入する
+                    # ループ2回目以降の処理：すでに記録してある pubDate よりも現在の pubDate の方が新しければ、max_date を更新する
+                    if (max_date is None) or (pub_date > max_date[1]):
+                        max_date = (free_date, pub_date)
+                except Exception as e:
+                    continue  # 無効な日付はスキップ
+
+        if max_date:
+            return max_date[0]
+    except Exception as e:
+        return None
+
 def is_older_than_7_days(name, feed_url):
     try:
-        parsed = feedparser.parse(feed_url)
-        entries = parsed.entries
-        if not entries:
+        feed = feedparser.parse(feed_url)
+
+        # 各日付を取得
+        published_date = get_published_date(feed)
+        updated_date = get_updated_date(feed)
+        free_term_date = get_free_term_start_date(feed_url)
+
+        # 比較用の最新日付
+        valid_dates = [d for d in [published_date, updated_date, free_term_date] if d is not None]
+        if not valid_dates:
+            logging.warning(f"[!] {name} の日付が取得できませんでした")
             return True, None
-        latest = entries[0].get("published_parsed") or entries[0].get("updated_parsed")
-        if not latest:
-            return True, None
-        latest_date = datetime.datetime(*latest[:6])
-        delta = datetime.datetime.now() - latest_date
+
+        latest_date = max(valid_dates)
+        delta = datetime.now(latest_date.tzinfo) - latest_date
         return delta.days <= 7, latest_date.strftime("%Y-%m-%d")
     except Exception as e:
         logging.exception(f"[!] フィード解析失敗: {name} : {feed_url} ({e})")
@@ -119,7 +188,6 @@ def main():
 
     # 3. 各サイトのRSSチェック
     for site in manga_sites:
-
         name = site.get("name")
         url = site.get("url")
         if not url:
