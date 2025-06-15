@@ -1,3 +1,6 @@
+rss_reader.log
+recent_feeds.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
